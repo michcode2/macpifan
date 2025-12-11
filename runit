@@ -1,0 +1,4 @@
+cargo build -r
+cp target/release/macpifan ./
+sudo ./macpifan
+rm ./macpifan
