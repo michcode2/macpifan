@@ -7,33 +7,63 @@ use std::{
     time::{Duration, Instant},
 };
 
-fn main() {
-    let (smc_path, i_0, k_i, k_p, target) = read_config();
+use toml::Table;
 
-    take_fan_control(&smc_path);
+fn main() {
+    let config = read_config();
+
+    take_fan_control(&config.smc_path);
 
     let mut time = Instant::now();
 
-    let integral_term = Arc::new(RwLock::new(i_0));
+    let integral_term = Arc::new(RwLock::new(config.initial_integral));
 
     let output_integral = integral_term.clone();
-    let output_path = smc_path.clone();
+    let output_path = config.smc_path.clone();
+    let wait_time = (config.update_interval * 1000.0) as u64;
+    let log_file: PathBuf = config.output_path;
     thread::spawn(move || {
         sleep(Duration::from_secs(1));
+
+        match fs::exists(log_file.parent().unwrap()) {
+            Ok(true) => (),
+            Ok(false) => fs::create_dir(log_file.parent().unwrap()).unwrap(),
+            Err(_) => (),
+        }
+
         loop {
-            println!(
-                "{:.2e}, {} deg, {} rpm",
-                *output_integral.read().unwrap() as f32,
-                read_max_temperature(&output_path),
-                read_speed(&output_path)
-            );
-            sleep(Duration::from_secs(3));
+            let mut write_string = String::new();
+            if config.output_integral {
+                write_string = format!("{} |", *output_integral.try_read().unwrap());
+            }
+            if config.output_speed {
+                write_string = format!("{} {}rpm |", write_string, read_speed(&output_path));
+            }
+            if config.output_temperature {
+                write_string = format!(
+                    "{} {} deg ",
+                    write_string,
+                    read_max_temperature(&output_path)
+                );
+            }
+            write_string = format!("{}\n", write_string);
+
+            {
+                let mut file = File::options()
+                    .write(true)
+                    .create(true)
+                    .open(log_file.clone())
+                    .expect("couldnt open logging file, are you root?");
+                file.write(write_string.as_bytes()).unwrap();
+            }
+
+            sleep(Duration::from_millis(wait_time));
         }
     });
 
     loop {
-        let error = read_max_temperature(&smc_path) - target;
-        let speed = read_speed(&smc_path);
+        let error = read_max_temperature(&config.smc_path) - config.target_temperature;
+        let speed = read_speed(&config.smc_path);
         if speed < 6000 {
             // avoid integral windup
 
@@ -49,48 +79,88 @@ fn main() {
             *w += val_to_write;
         }
         time = Instant::now();
-        let setpoint = *integral_term.try_read().unwrap() * k_i + k_p * error as f64;
-        write_speed(&smc_path, setpoint as usize);
+        let setpoint = *integral_term.try_read().unwrap() * config.constant_integral
+            + config.constant_proportional * error as f64;
+        write_speed(&config.smc_path, setpoint as usize);
         sleep(Duration::from_millis(50));
     }
 }
 
-fn read_config() -> (PathBuf, f64, f64, f64, i64) {
-    let file = fs::read_to_string("config").expect("cant find the config file");
+struct Config {
+    smc_path: PathBuf,
+    initial_integral: f64,
+    constant_integral: f64,
+    constant_proportional: f64,
+    target_temperature: i64,
+    update_interval: f64,
+    output_path: PathBuf,
+    output_integral: bool,
+    output_temperature: bool,
+    output_speed: bool,
+}
 
-    let mut path_string = file.lines();
-    let path = PathBuf::from(
-        path_string
-            .next()
-            .expect("where is the smc (/sys/devices/platform/applesmc.768)"),
-    );
-    let i_0 = path_string
-        .next()
-        .expect("what is the initial integral value (10000)")
-        .parse()
-        .unwrap_or(10000.0);
-    let k_i = path_string
-        .next()
-        .expect("what is the integral term (0.05)")
-        .parse()
-        .unwrap_or(0.05);
-    let k_p = path_string
-        .next()
-        .expect("what is the proportional term (400.0)")
-        .parse()
-        .unwrap_or(400.0);
-
-    let target = path_string
-        .next()
-        .expect("what is the target temperature (70)")
-        .parse()
-        .unwrap_or(70);
+fn read_config() -> Config {
+    let file =
+        fs::read_to_string("/etc/macpifan/macpifan.toml").expect("cant find the config file");
+    let entries = file.as_str().parse::<Table>().unwrap();
+    let config = Config {
+        smc_path: PathBuf::from(
+            entries["inout"]["smc_path"]
+                .clone()
+                .try_into()
+                .unwrap_or("/sys/devices/platform/applesmc.768"),
+        ),
+        initial_integral: entries["controller_values"]["initial_integral"]
+            .clone()
+            .try_into()
+            .unwrap_or(20000.0),
+        constant_integral: entries["controller_values"]["constant_integral"]
+            .clone()
+            .try_into()
+            .unwrap_or(0.02),
+        constant_proportional: entries["controller_values"]["constant_proportional"]
+            .clone()
+            .try_into()
+            .unwrap_or(400.0),
+        target_temperature: entries["controller_values"]["target_temperature"]
+            .clone()
+            .try_into()
+            .unwrap_or(65),
+        update_interval: entries["inout"]["update_interval"]
+            .clone()
+            .try_into()
+            .unwrap_or(3.0),
+        output_path: PathBuf::from(
+            entries["inout"]["output_path"]
+                .clone()
+                .try_into()
+                .unwrap_or("/run/macpifan/values"),
+        ),
+        output_integral: entries["inout"]["output_integral"]
+            .clone()
+            .try_into()
+            .unwrap_or(true),
+        output_temperature: entries["inout"]["output_temperature"]
+            .clone()
+            .try_into()
+            .unwrap_or(true),
+        output_speed: entries["inout"]["output_speed"]
+            .clone()
+            .try_into()
+            .unwrap_or(true),
+    };
 
     println!("starting macpifan");
     println!("| i_0\t| k_i\t| k_p\t| target\t|");
-    println!("| {:.1e}\t| {}\t| {}\t| {}\t\t|", i_0, k_i, k_p, target);
+    println!(
+        "| {:.1e}\t| {}\t| {}\t| {}\t\t|",
+        config.initial_integral,
+        config.constant_proportional,
+        config.constant_integral,
+        config.target_temperature
+    );
 
-    return (path, i_0, k_i, k_p, target);
+    return config;
 }
 
 fn take_fan_control(path: &PathBuf) {
@@ -130,7 +200,7 @@ fn read_max_temperature(path: &PathBuf) -> i64 {
         let mut file = File::open(path.join(format!("temp{}_input", i))).unwrap();
         file.read_to_string(&mut string).unwrap();
         string = string.trim_ascii_end().to_string();
-        acc += string.parse::<u64>().unwrap() / 1000;
+        acc += string.parse::<u64>().unwrap_or(71000) / 1000;
     }
     return (acc / 8) as i64;
 }
