@@ -37,7 +37,12 @@ fn main() {
                 write_string = format!("{} |", *output_integral.try_read().unwrap());
             }
             if config.output_speed {
-                write_string = format!("{} {}rpm |", write_string, read_speed(&output_path));
+                let speed = read_speed(&output_path).to_string();
+                write_string = format!(
+                    "{} {:0>4} rpm |",
+                    write_string,
+                    if speed == "0" { "0000" } else { &speed }
+                );
             }
             if config.output_temperature {
                 write_string = format!(
@@ -46,8 +51,6 @@ fn main() {
                     read_max_temperature(&output_path)
                 );
             }
-            write_string = format!("{}\n", write_string);
-
             {
                 let mut file = File::options()
                     .write(true)
@@ -64,7 +67,7 @@ fn main() {
     loop {
         let error = read_max_temperature(&config.smc_path) - config.target_temperature;
         let speed = read_speed(&config.smc_path);
-        if speed < 6000 {
+        if speed < 1000 {
             // avoid integral windup
 
             let temp_integral = *integral_term.try_read().unwrap();
@@ -103,12 +106,13 @@ fn read_config() -> Config {
     let file =
         fs::read_to_string("/etc/macpifan/macpifan.toml").expect("cant find the config file");
     let entries = file.as_str().parse::<Table>().unwrap();
+    println!("{:?}", entries["controller_values"]["goto"]);
     let config = Config {
         smc_path: PathBuf::from(
             entries["inout"]["smc_path"]
                 .clone()
                 .try_into()
-                .unwrap_or("/sys/devices/platform/applesmc.768"),
+                .unwrap_or("/sys/devices/platform/dell_smm_hwmon/hwmon/hwmon5"),
         ),
         initial_integral: entries["controller_values"]["initial_integral"]
             .clone()
@@ -122,10 +126,10 @@ fn read_config() -> Config {
             .clone()
             .try_into()
             .unwrap_or(400.0),
-        target_temperature: entries["controller_values"]["target_temperature"]
+        target_temperature: entries["controller_values"]["goto"]
             .clone()
             .try_into()
-            .unwrap_or(65),
+            .unwrap_or(45),
         update_interval: entries["inout"]["update_interval"]
             .clone()
             .try_into()
@@ -151,7 +155,7 @@ fn read_config() -> Config {
     };
 
     println!("starting macpifan");
-    println!("| i_0\t| k_i\t| k_p\t| target\t|");
+    println!("| i_0\t| k_p\t| k_i\t| target\t|");
     println!(
         "| {:.1e}\t| {}\t| {}\t| {}\t\t|",
         config.initial_integral,
@@ -164,9 +168,10 @@ fn read_config() -> Config {
 }
 
 fn take_fan_control(path: &PathBuf) {
+    return;
     let mut file = File::options()
         .write(true)
-        .open(path.join("fan1_manual"))
+        .open(path.join("fan1_target"))
         .expect("couldnt open fan1_manual, are you root?");
 
     file.write("1".as_bytes()).expect("fucked up the write");
@@ -182,11 +187,11 @@ fn read_speed(path: &PathBuf) -> usize {
 
 fn write_speed(path: &PathBuf, mut speed: usize) {
     take_fan_control(path);
-    speed = speed.min(6200).max(1300);
+    speed = speed.min(255).max(50);
     let mut file = File::options()
         .write(true)
         .read(true)
-        .open(path.join("fan1_output"))
+        .open(path.join("pwm1"))
         .unwrap();
     file.write_all(format!("{}", speed).as_bytes()).unwrap();
     let mut contents = vec![0_u8; 100];
@@ -195,12 +200,10 @@ fn write_speed(path: &PathBuf, mut speed: usize) {
 
 fn read_max_temperature(path: &PathBuf) -> i64 {
     let mut acc = 0;
-    for i in 6..=13 {
-        let mut string = "".to_string();
-        let mut file = File::open(path.join(format!("temp{}_input", i))).unwrap();
-        file.read_to_string(&mut string).unwrap();
-        string = string.trim_ascii_end().to_string();
-        acc += string.parse::<u64>().unwrap_or(71000) / 1000;
-    }
-    return (acc / 8) as i64;
+    let mut string = "".to_string();
+    let mut file = File::open(path.join("temp1_input")).unwrap();
+    file.read_to_string(&mut string).unwrap();
+    string = string.trim_ascii_end().to_string();
+    acc += string.parse::<u64>().unwrap_or(71000) / 1000;
+    return acc as i64;
 }
